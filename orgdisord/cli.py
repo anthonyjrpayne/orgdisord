@@ -196,6 +196,14 @@ def cli():
     default=False,
     help="Ignore species when merging structures?",
 )
+@click.option(
+    "--keep_primitive",
+    is_flag=True,
+    default=False,
+    help="Keep primitive configurations in a primitive_cells folder for debugging.",
+)
+    
+    
 def main(
     ctx,
     files,
@@ -220,6 +228,7 @@ def main(
     ratio,
     ratio_tol,
     ignore_species,
+    keep_primitive,
 ):
     """Command line interface for orgdisord."""
     # set up logging
@@ -324,6 +333,8 @@ def main(
         fix_ratio=fix_ratio,
         ratio=ratio,
         ratio_tolerance=ratio_tol,
+        keep_primitive=keep_primitive,
+        primitive_dir="primitive_cells",
     )
     if len(images) == 0:
         logger.warning("No ordered configurations found.")

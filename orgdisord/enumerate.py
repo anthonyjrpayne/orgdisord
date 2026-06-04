@@ -246,9 +246,32 @@ def save_as_xyz_raw(atoms_object, filename, debug_name=""):
         f.write(f"{total_atoms}\n")
         f.write(f"RAW State ({debug_name})\n")
         for symbol, pos in zip(symbols, positions):
-            f.write(f"{symbol} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\n")
-    # print(f"WROTE: {os.path.abspath(filename)}")
+            f.write(f"{symbol} {pos[0]:.8f} {pos[1]:.8f} {pos[2]:.8f}\n")
 
+def save_primitive_cells(primitive_configs, primitive_dir="primitive_cells"):
+    """
+    Save all primitive configurations to an xyz folder for debugging/review.
+
+    The coordinates are written exactly as stored in the Atoms objects.
+    """
+    os.makedirs(primitive_dir, exist_ok=True)
+
+    for i_config, atoms in enumerate(primitive_configs):
+        filename = os.path.join(
+            primitive_dir,
+            f"primitive_config_{i_config}.xyz",
+        )
+        save_as_xyz_raw(
+            atoms,
+            filename,
+            debug_name=f"primitive_config_{i_config}",
+        )
+
+    logger.info(
+        "Wrote %d primitive configurations to %s",
+        len(primitive_configs),
+        os.path.abspath(primitive_dir),
+    )
 
 def binary_to_idx(config, maxgroups):
     return sum([j * (maxgroups**i) for i, j in list(enumerate(reversed(config)))])
@@ -444,15 +467,15 @@ class OrderedfromDisordered:
 
         return atoms
 
-    def get_all_configs(self, exclude_ordered=False):
+    def get_all_configs(
+        self,
+        exclude_ordered=False,
+        keep_primitive=False,
+        primitive_dir="primitive_cells",
+        ):
         """Generate all possible configs for the primitive cell and return them as
         absolute-cartesian, unwrapped ASE Atoms objects (NOT wrapped into [0,1)).
         """
-        # Create a folder for debug output (unchanged)
-        debug_dir = "debug_configs"
-        os.makedirs(debug_dir, exist_ok=True)
-        
-        print(debug_dir)
 
         cell = self.disordered_structure.cell
         Z = self.disordered_structure.Z
@@ -587,12 +610,6 @@ class OrderedfromDisordered:
                     temp = make_whole_molecule(temp, preserve_pbc=False)
                     all_configs.append(temp)
 
-        # # Save debug xyzs of the resulting primitive configs for debugging
-        # for i_config, tmp in enumerate(all_configs):
-        #     filename = os.path.join(debug_dir, f"primitive_config_{i_config}.xyz")
-        #     save_as_xyz_raw(tmp, filename, debug_name=f"Config {i_config} (raw, unwrapped)")
-
-
         # Decide reference: either an explicit reference or the first config
         reference_atoms = all_configs[0]  # choose first config as canonical layout
         cell = np.asarray(reference_atoms.get_cell())
@@ -613,10 +630,11 @@ class OrderedfromDisordered:
 
         all_configs = aligned_configs
         
-        # # Save debug xyzs of the resulting primitive configs for debugging
-        # for i_config, tmp in enumerate(all_configs):
-        #     filename = os.path.join(debug_dir, f"primitive_config_{i_config}_aligned.xyz")
-        #     save_as_xyz_raw(tmp, filename, debug_name=f"Config_{i_config}_aligned.xyz")
+        if keep_primitive:
+            save_primitive_cells(
+                all_configs,
+                primitive_dir=primitive_dir,
+            )
 
         self.logger.debug(f"Generated {len(all_configs)} primitive configs")
         return all_configs
@@ -631,6 +649,8 @@ class OrderedfromDisordered:
         fix_ratio=False,
         ratio=None,
         ratio_tolerance=0.01,
+        keep_primitive=False,
+        primitive_dir="primitive_cells",
     ):
         """
         loop over supercell cells,
@@ -674,7 +694,11 @@ class OrderedfromDisordered:
 
         ########################################
         # Get all primitive configs
-        self.images = self.get_all_configs(exclude_ordered)
+        self.images = self.get_all_configs(
+            exclude_ordered=exclude_ordered,
+            keep_primitive=keep_primitive,
+            primitive_dir=primitive_dir,
+        )
         nimages_prim = len(self.images)
         if self.disordered_structure.molecular_crystal:
             self.logger.debug(f"Reloading {nimages_prim} images as molecular crystals")
