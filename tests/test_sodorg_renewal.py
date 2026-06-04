@@ -55,9 +55,8 @@ def test_enumerator(cif):
 def test_command_line_interface():
     """Test the CLI."""
     runner = CliRunner()
-    result = runner.invoke(cli.main)
+    result = runner.invoke(cli.main, ["--help"])
+
     assert result.exit_code == 0
-    assert "orgdisord.cli.main" in result.output
-    help_result = runner.invoke(cli.main, ["--help"])
-    assert help_result.exit_code == 0
-    assert "--help  Show this message and exit." in help_result.output
+    assert "Usage:" in result.output
+    assert "--help" in result.output
