@@ -1,6 +1,7 @@
 """Console script for orgdisord."""
 import sys
 import os
+import json
 import click
 from orgdisord.disordered_structure import from_disorder_components
 from orgdisord.parse_cif_file import CifParser
@@ -32,6 +33,68 @@ LOGHEADER = """
 #                                                                   CCP-NC    #
 ###############################################################################
 """
+
+def _json_safe(value):
+    """Convert numpy/python objects into JSON-safe types."""
+    if isinstance(value, dict):
+        return {
+            str(k): _json_safe(v)
+            for k, v in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+
+    if isinstance(value, np.integer):
+        return int(value)
+
+    if isinstance(value, np.floating):
+        return float(value)
+
+    return value
+
+
+def write_enumeration_manifest(
+    manifest_path,
+    files,
+    written_files,
+    image_metadata,
+):
+    """
+    Write metadata linking generated structure files to disorder components.
+
+    This is mainly for downstream cspy-disord database creation.
+    """
+    if len(files) == 1:
+        source_file = os.path.abspath(files[0])
+    else:
+        source_file = [os.path.abspath(f) for f in files]
+
+    manifest = {
+        "source_file": source_file,
+        "structures": [],
+    }
+
+    for filename, metadata in zip(written_files, image_metadata):
+        structure_id = os.path.splitext(os.path.basename(filename))[0]
+
+        manifest["structures"].append(
+            {
+                "id": structure_id,
+                "file": os.path.basename(filename),
+                "components": metadata.get("components"),
+                "ratio": metadata.get("ratio"),
+                "multiplicity": metadata.get("multiplicity", 1),
+            }
+        )
+
+    with open(manifest_path, "w") as handle:
+        json.dump(_json_safe(manifest), handle, indent=2)
+
+    return manifest_path
 
 
 @click.group()
@@ -336,6 +399,13 @@ def main(
         keep_primitive=keep_primitive,
         primitive_dir="primitive_cells",
     )
+    
+    image_metadata = getattr(
+        od,
+        "supercell_config_metadata",
+        [{} for _ in images],
+    )
+    
     if len(images) == 0:
         logger.warning("No ordered configurations found.")
         return
@@ -405,6 +475,25 @@ def main(
         # overwrite images with merged images
         images = [g[0] for g in groups]
 
+        merged_image_metadata = []
+
+        for ig, group_inds in enumerate(group_indices):
+            if len(group_inds) == 0:
+                merged_image_metadata.append(
+                    {
+                        "components": None,
+                        "ratio": None,
+                        "multiplicity": int(groups[ig][1]),
+                    }
+                )
+                continue
+
+            base_metadata = dict(image_metadata[group_inds[0]])
+            base_metadata["multiplicity"] = int(groups[ig][1])
+            merged_image_metadata.append(base_metadata)
+
+        image_metadata = merged_image_metadata
+
         # tag images with group indices in df
         for ig, group_inds in enumerate(group_indices):
             for g in group_inds:
@@ -456,8 +545,11 @@ def main(
 
         os.mkdir(directory)
         nleading_zeros = len(str(len(images)))
+        written_files = []
+
         for i, image in enumerate(images):
             filename = f"{prefix}-{str(i).zfill(nleading_zeros)}.{format}"
+            output_path = os.path.join(directory, filename)
             kwargs = {}
             # cif can save labels if we manually specify them
             if format == "cif":
@@ -472,9 +564,19 @@ def main(
                 # so let's remove them
                 image.set_array("occupancies", None)
 
-            image.write(f"{directory}/{filename}", **kwargs)
+            image.write(output_path, **kwargs)
+            written_files.append(output_path)
 
-            logger.info(f"Wrote structure to file: {directory}/{filename}")
+            #logger.info(f"Wrote structure to file: {output_path}")
+            
+        manifest_path = os.path.join(directory, f"{prefix}_metadata.json")
+        write_enumeration_manifest(
+            manifest_path=manifest_path,
+            files=files,
+            written_files=written_files,
+            image_metadata=image_metadata,
+        )
+        logger.info(f"Wrote enumeration metadata to file: {manifest_path}")
 
     # write out pandas dataframe containing the groups and multiplicities
 

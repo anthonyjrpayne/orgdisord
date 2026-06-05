@@ -311,6 +311,23 @@ def chunks(lst, n, offset=0):
         yield temp[i : i + n]
 
 
+def merge_component_counts(*count_dicts):
+    counts = Counter()
+    for count_dict in count_dicts:
+        counts.update(count_dict)
+    return dict(counts)
+
+
+def ratio_from_component_counts(component_counts):
+    total = sum(component_counts.values())
+    if total == 0:
+        return {}
+    return {
+        key: value / total
+        for key, value in sorted(component_counts.items())
+    }
+
+
 class OrderedfromDisordered:
     def __init__(self, disordered_structure, symprec=1e-4, quiet=False):
         """
@@ -532,6 +549,7 @@ class OrderedfromDisordered:
             )
 
         all_configs = []
+        all_config_metadata = []
         for assembly in self.disordered_structure.disorder_assemblies:
             asslabel = assembly.label
             # the disorder groups for this assembly
@@ -571,9 +589,23 @@ class OrderedfromDisordered:
                 config_max = ngroups
 
             # generate all possible configs for this assembly
-            config_indices = itertools.product(list(range(config_max)), repeat=Z)
+            config_indices = list(
+                itertools.product(list(range(config_max)), repeat=Z)
+            )
+
             assembly_configs = [
-                self.get_config(config_idx, asslabel) for config_idx in config_indices
+                self.get_config(config_idx, asslabel)
+                for config_idx in config_indices
+            ]
+
+            assembly_config_metadata = [
+                {
+                    "components": self._component_counts_for_config(
+                        config_idx,
+                        asslabel,
+                    )
+                }
+                for config_idx in config_indices
             ]
             # update max_spacegroup_kinds tags
             for config in assembly_configs:
@@ -593,22 +625,44 @@ class OrderedfromDisordered:
                         temp = all_configs[iconfig].copy()
                         temp.extend(assembly_configs[iconfig])
                         all_configs[iconfig] = temp
+                        
+                        all_config_metadata[iconfig]["components"] = (
+                            merge_component_counts(
+                                all_config_metadata[iconfig]["components"],
+                                assembly_config_metadata[iconfig]["components"],
+                            )
+                        )
                 else:
                     ref_configs = [config.copy() for config in all_configs]
+                    ref_metadata = [dict(meta) for meta in all_config_metadata]
+
                     all_configs = []
+                    all_config_metadata = []
+
                     for iconfig in range(len(ref_configs)):
                         for jconfig in range(len(assembly_configs)):
                             temp = ref_configs[iconfig].copy()
                             temp.extend(assembly_configs[jconfig])
                             all_configs.append(temp)
+
+                            components = merge_component_counts(
+                                ref_metadata[iconfig]["components"],
+                                assembly_config_metadata[jconfig]["components"],
+                            )
+                            all_config_metadata.append(
+                                {"components": components}
+                            )
             else:
                 # must the be first assembly -- all_configs is empty so let's start from scratch
-                for config in assembly_configs:
+                 for config, metadata in zip(
+                    assembly_configs,
+                    assembly_config_metadata,
+                ):
                     temp = atoms.copy()
                     temp.extend(config)
-                    # Ensure molecule connectivity is preserved and positions are absolute
                     temp = make_whole_molecule(temp, preserve_pbc=False)
                     all_configs.append(temp)
+                    all_config_metadata.append(metadata)
 
         # Decide reference: either an explicit reference or the first config
         reference_atoms = all_configs[0]  # choose first config as canonical layout
@@ -629,6 +683,7 @@ class OrderedfromDisordered:
             aligned_configs.append(cfg_aligned)
 
         all_configs = aligned_configs
+        self.primitive_config_metadata = all_config_metadata
         
         if keep_primitive:
             save_primitive_cells(
@@ -776,6 +831,7 @@ class OrderedfromDisordered:
 
         all_supercells = []
         all_configs = []
+        all_supercell_metadata = []
         if random_configs:
             self.logger.info(
                 f"Generating {n_configs} random configurations in a {supercell} supercell:"
@@ -793,6 +849,30 @@ class OrderedfromDisordered:
             # make ncells copies of the relevant config
             self.logger.debug(f"         {config}")
             all_supercells.append(self.get_supercell_config(config))
+            all_configs.append(config)
+
+            primitive_indices = select_configs(
+                config,
+                supercell=self.supercell,
+                maxgroups=self.ndisordergroups,
+            )
+
+            component_counts = Counter()
+            for prim_idx in primitive_indices:
+                component_counts.update(
+                    self.primitive_config_metadata[prim_idx]["components"]
+                )
+
+            component_counts = dict(sorted(component_counts.items()))
+            all_supercell_metadata.append(
+                {
+                    "components": component_counts,
+                    "ratio": ratio_from_component_counts(component_counts),
+                    "multiplicity": 1,
+                    "config": list(config),
+                    "primitive_config_indices": list(primitive_indices),
+                }
+            )
             # TODO
             # check for overlapping atoms
             # cutoff = 0.25
@@ -800,15 +880,18 @@ class OrderedfromDisordered:
             # if (dists < cutoff**2).any():
             #     continue
             # else:
-            all_configs.append(config)
 
         if fix_ratio:
             self.logger.info(
                 f"Only {len(all_configs)}/{n_configs} configs had the specified ratio of {self.ratio}"
             )
+            
+        self.supercell_config_metadata = all_supercell_metadata
+        
         if return_configs:
             return all_supercells, all_configs
         return all_supercells
+    
 
     def _process_ratio(self, ratio):
         """
@@ -911,3 +994,38 @@ class OrderedfromDisordered:
             # add this block into the supercell
             supercell_atoms.extend(temp)
         return supercell_atoms
+    
+    def _component_label(self, asslabel, group):
+        """
+        Generic component label based on CIF disorder assembly/group.
+
+        Examples:
+            assembly A, group 1 -> A1
+            assembly A, group 2 -> A2
+            assembly B, group 1 -> B1
+        """
+        return f"{asslabel}{group.label}"
+
+    def _component_counts_for_config(self, config, asslabel):
+        """
+        Count selected disorder groups for one primitive-cell configuration.
+
+        This avoids using molecular formulae, so two disorder alternatives with
+        the same formula remain distinguishable as e.g. A1 and A2.
+        """
+        assembly = self.disordered_structure.get_assembly(asslabel)
+        disorder_groups = assembly.disorder_groups
+
+        counts = Counter()
+
+        if len(disorder_groups) == 1:
+            label = self._component_label(asslabel, disorder_groups[0])
+            counts[label] += len(config)
+            return dict(counts)
+
+        for c in config:
+            group = disorder_groups[int(c)]
+            label = self._component_label(asslabel, group)
+            counts[label] += 1
+
+        return dict(counts)
