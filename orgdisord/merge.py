@@ -82,7 +82,7 @@ def merge_structures(
             raise ValueError(
                 "symops must be provided for the symmetric merging algorithm"
             )
-        groups = merge_symm(
+        groups = merge_symm_hash(
             images,
             symops,
             use_disordered_only=use_disordered_only,
@@ -221,6 +221,107 @@ def compare_ref_unmatched(
 
     return matching_inds
 
+
+def symmetry_keys_for_structure(coords, symbols, symops, symprec=1e-4, check_species=True):
+    """
+    Make all hash keys for one structure under the supplied symmetry operations.
+    """
+    coords = np.mod(np.asarray(coords, dtype=float), 1.0)
+
+    scale = int(round(1.0 / symprec))
+    if scale <= 0:
+        raise ValueError(f"Invalid symprec: {symprec}")
+
+    keys = set()
+
+    for rot, trans in symops:
+        transformed = np.mod(coords @ np.asarray(rot).T + np.asarray(trans), 1.0)
+        quantised = np.mod(np.rint(transformed * scale).astype(int), scale)
+
+        rows = []
+        for i, q in enumerate(quantised):
+            symbol = str(symbols[i]) if check_species else "X"
+            rows.append((symbol, int(q[0]), int(q[1]), int(q[2])))
+
+        keys.add(tuple(sorted(rows)))
+
+    return keys
+
+
+def _find(parent, i):
+    while parent[i] != i:
+        parent[i] = parent[parent[i]]
+        i = parent[i]
+    return i
+
+
+def _union(parent, a, b):
+    ra = _find(parent, a)
+    rb = _find(parent, b)
+
+    if ra != rb:
+        parent[rb] = ra
+
+def merge_symm_hash(
+    supercell_images,
+    symops,
+    symprec=1e-4,
+    use_disordered_only=True,
+    quiet=False,
+    check_species=True,
+):
+    """
+    Fast symmetry merge using precomputed symmetry coordinate signatures.
+
+    This avoids the old pairwise N_atoms x N_atoms coordinate matching.
+    """
+    records = []
+
+    for i, atoms in enumerate(supercell_images):
+        current_symbols = atoms.get_chemical_symbols()
+        current_positions = atoms.get_scaled_positions()
+
+        if use_disordered_only:
+            disordered_idx = np.where(atoms.get_tags() != 0)[0]
+            coords = current_positions[disordered_idx]
+            syms = [current_symbols[j] for j in disordered_idx]
+        else:
+            coords = current_positions
+            syms = current_symbols
+
+        records.append((i, coords, syms))
+
+    parent = list(range(len(records)))
+    key_owner = {}
+
+    pbar = tqdm(
+        records,
+        desc="Hashing symmetry-equivalence",
+        disable=quiet,
+    )
+
+    for i, coords, syms in pbar:
+        keys = symmetry_keys_for_structure(
+            coords,
+            symbols=syms,
+            symops=symops,
+            symprec=symprec,
+            check_species=check_species,
+        )
+
+        for key in keys:
+            if key in key_owner:
+                _union(parent, i, key_owner[key])
+            else:
+                key_owner[key] = i
+
+    groups_by_root = {}
+
+    for i in range(len(records)):
+        root = _find(parent, i)
+        groups_by_root.setdefault(root, []).append(records[i][0])
+
+    return list(groups_by_root.values())
 
 def merge_symm(
     supercell_images,

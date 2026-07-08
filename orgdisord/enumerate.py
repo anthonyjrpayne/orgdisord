@@ -1,6 +1,6 @@
-"""Module to enumerate ordered structures given a cif object containing disorder information."""
 import numpy as np
 import os
+import re
 from ase.neighborlist import natural_cutoffs, NeighborList
 from ase.spacegroup.spacegroup import SpacegroupValueError
 from ase import Atoms, Atom
@@ -12,269 +12,235 @@ import itertools
 from tqdm import tqdm
 from scipy.spatial.distance import pdist
 import logging
+from functools import lru_cache
 from orgdisord.utils import reload_as_molecular_crystal, random_product
+
 
 logger = logging.getLogger("orgdisord.enumerate")
 
-def _build_neighborlist_for_atoms(atoms, cutoff_scale=1.25):
+
+def _split_label(label):
+    """Return (component, site, atom_name) from labels like A2m1_S001_C13."""
+    text = str(label)
+    parts = text.split("_")
+
+    component = None
+    site = None
+    atom_name = text
+
+    if parts:
+        match = re.match(r"(A\d+)", parts[0])
+        component = match.group(1) if match else parts[0]
+
+    for part in parts:
+        if re.fullmatch(r"S\d+", part):
+            site = part
+            break
+
+    if len(parts) >= 2:
+        atom_name = parts[-1]
+
+    return component, site, atom_name
+
+
+def _atoms_labels(atoms):
+    """Return atom labels if present, otherwise stable symbol-index fallback labels."""
+    if atoms.has("labels"):
+        return np.asarray(atoms.get_array("labels")).astype(str)
+
+    return np.asarray(
+        [f"{symbol}{i}" for i, symbol in enumerate(atoms.get_chemical_symbols())],
+        dtype=str,
+    )
+
+
+def _same_molecular_site(labels, i, j):
     """
-    Build an ASE NeighborList using covalent radii * cutoff_scale.
-    This returns the neighborlist object; note that we DO NOT automatically
-    interpret every neighbor as a bond — caller can filter pairs (e.g. skip H-H).
+    Only allow bonding within the same labelled site when site labels exist.
+
+    This prevents neighbour-list connectivity joining different disordered
+    molecular sites across a short intermolecular contact. If site labels are
+    absent, fall back to normal chemical connectivity.
     """
+    si = _split_label(labels[i])[1]
+    sj = _split_label(labels[j])[1]
+
+    if si is None or sj is None:
+        return True
+
+    return si == sj
+
+
+def connected_components_indices(atoms, cutoff_scale=1.5, exclude_hh=True):
+    """Return bonded molecular components as lists of atom indices."""
+    labels = _atoms_labels(atoms)
     numbers = atoms.get_atomic_numbers().astype(int)
-    # safe fallback handled by covalent_radii from ASE
-    radii = np.array([float(covalent_radii[z]) if z < len(covalent_radii) else 0.7 for z in numbers])
-    per_atom_cutoffs = radii * cutoff_scale
-    nl = NeighborList(per_atom_cutoffs.tolist(), self_interaction=False, bothways=True, skin=0.0)
+
+    radii = np.asarray(
+        [float(covalent_radii[z]) if z < len(covalent_radii) else 0.7 for z in numbers]
+    )
+    nl = NeighborList(
+        (radii * cutoff_scale).tolist(),
+        self_interaction=False,
+        bothways=True,
+        skin=0.0,
+    )
     nl.update(atoms)
-    return nl
 
-def connected_components_indices(atoms, cutoff_scale=1.25, exclude_hh=True):
-    """
-    Return list-of-lists of atom indices per connected component, using covalent cutoffs.
-    If exclude_hh is True, H-H neighbor pairs are ignored when forming connectivity.
-    """
-    nl = _build_neighborlist_for_atoms(atoms, cutoff_scale=cutoff_scale)
-    N = len(atoms)
-    visited = np.zeros(N, dtype=bool)
-    comps = []
-    numbers = atoms.get_atomic_numbers().astype(int)
+    visited = np.zeros(len(atoms), dtype=bool)
+    components = []
 
-    for i in range(N):
-        if visited[i]:
+    for start in range(len(atoms)):
+        if visited[start]:
             continue
-        queue = [i]
-        comp = []
-        visited[i] = True
+
+        queue = [start]
+        visited[start] = True
+        component = []
+
         while queue:
-            idx = queue.pop(0)
-            comp.append(idx)
-            neighs, offsets = nl.get_neighbors(idx)
-            for nb_i, nb in enumerate(neighs):
-                # Skip H-H edges if requested
-                if exclude_hh and numbers[idx] == 1 and numbers[nb] == 1:
+            i = queue.pop(0)
+            component.append(i)
+
+            neighbours, offsets = nl.get_neighbors(i)
+            for j in neighbours:
+                if exclude_hh and numbers[i] == 1 and numbers[j] == 1:
                     continue
-                if not visited[nb]:
-                    visited[nb] = True
-                    queue.append(nb)
-        comps.append(comp)
-        
-    return comps
+                if not _same_molecular_site(labels, i, int(j)):
+                    continue
+                if not visited[j]:
+                    visited[j] = True
+                    queue.append(int(j))
+
+        components.append(component)
+
+    return components
 
 
-def component_centroids(atoms, comps, mass_weighted=False):
+def make_whole_molecule(atoms, cutoff_scale=1.5, preserve_pbc=False, exclude_hh=True):
     """
-    Return centroids (Nx3) for components `comps`.
-    If mass_weighted True, use atomic masses.
-    """
-    pos = atoms.get_positions()
-    centroids = []
-    if mass_weighted:
-        masses = atoms.get_masses()
-    for comp in comps:
-        coords = pos[comp]
-        if mass_weighted:
-            w = masses[comp][:, None]
-            c = (coords * w).sum(axis=0) / w.sum()
-        else:
-            c = coords.mean(axis=0)
-        centroids.append(c)
-    return np.array(centroids)
+    Unwrap bonded molecules so each connected component is Cartesian-contiguous.
 
-def find_best_integer_shift_for_centroid(centroid, ref_centroid, cell, max_offset=1):
-    """
-    Search integer offsets in [-max_offset..max_offset]^3 and return the offset vector
-    (integer triple) that makes centroid + offset@cell closest to ref_centroid.
-    """
-    best_off = np.array([0,0,0], dtype=int)
-    best_dist = np.linalg.norm(centroid - ref_centroid)
-    # iterate offsets (small cube). Increase max_offset if molecules can shift >1 cell
-    rng = range(-max_offset, max_offset+1)
-    for ox in rng:
-        for oy in rng:
-            for oz in rng:
-                off = np.array([ox, oy, oz], dtype=int)
-                cand = centroid + off @ cell
-                d = np.linalg.norm(cand - ref_centroid)
-                if d < best_dist - 1e-12:
-                    best_dist = d
-                    best_off = off.copy()
-    return best_off
-
-
-def align_components_to_reference(atoms, reference_centroids, cell,
-                                  cutoff_scale=1.25, max_offset=1,
-                                  mass_weighted=False, use_labels=True):
-    """
-    Align connected components (molecules) from `atoms` to reference_centroids by
-    integer-cell translations. Returns a new ASE Atoms copy.
-
-    - max_offset: search range [-max_offset..max_offset] for each axis (default 1).
-    - use_labels: if True and atoms have 'labels' array, map components by label match.
-    """
-    A = atoms.copy()
-    comps = connected_components_indices(A, cutoff_scale=cutoff_scale)
-    centroids = component_centroids(A, comps, mass_weighted=mass_weighted)
-    ref = np.asarray(reference_centroids)
-    new_positions = A.get_positions().copy()
-
-    # Build mapping from components -> reference index
-    comp_to_ref = [-1] * len(comps)
-    used_ref = np.zeros(len(ref), dtype=bool)
-
-    # Try label-based mapping if requested and labels exist
-    if use_labels and A.has("labels"):
-        labels = A.get_array("labels")
-        # for each component find the majority label (string) if any
-        comp_labels = []
-        for comp in comps:
-            lab = labels[comp]
-            # pick the most common label in the component
-            unique, counts = np.unique(lab, return_counts=True)
-            comp_labels.append(unique[np.argmax(counts)])
-    
-    # create distance matrix considering integer shifts
-    for ic, comp in enumerate(comps):
-        ccent = centroids[ic]
-        # find best reference index and shift
-        best_ridx = None
-        best_off = None
-        best_d = 1e9
-        for ridx in range(len(ref)):
-            if used_ref[ridx]:
-                continue
-            off = find_best_integer_shift_for_centroid(ccent, ref[ridx], cell, max_offset=max_offset)
-            cand = ccent + off @ cell
-            d = np.linalg.norm(cand - ref[ridx])
-            if d < best_d:
-                best_d = d
-                best_ridx = ridx
-                best_off = off
-        if best_ridx is None:
-            continue
-        comp_to_ref[ic] = best_ridx
-        used_ref[best_ridx] = True
-        # apply shift immediately
-        new_positions[comp] += best_off @ cell
-
-    # Write positions back before computing "after" centroids
-    A.set_positions(new_positions)
-
-    return A
-
-def make_whole_molecule(atoms, cutoff_scale=1.25, preserve_pbc=False, exclude_hh=True):
-    """
-    Unwrap connected molecules so each connected component is contiguous in Cartesian space.
-
-    - atoms: ASE Atoms (can be periodic). Function works from current positions and cell.
-    - cutoff_scale: multiplier for (r_i + r_j) to determine bond cutoff between atoms i and j.
-    - preserve_pbc: if True, preserve atoms.pbc; otherwise set pbc=False on returned Atoms.
-    - exclude_hh: if True, ignore H-H pairs when building connectivity graph (prevents false H-H bonds).
-
-    Returns a copy of `atoms` with positions moved by integer multiples of cell vectors
-    so connected components are placed compactly (no pieces split across periodic images).
+    This is the only coordinate repair done here. It deliberately does not sort
+    atoms, standardise molecular orientation, or choose a different molecular
+    image by shape matching.
     """
     if len(atoms) == 0:
         return atoms.copy()
 
     A = atoms.copy()
-    cell = np.asarray(A.get_cell())    # 3x3 array
-    pos = A.get_positions().copy()
+    labels = _atoms_labels(A)
     numbers = A.get_atomic_numbers().astype(int)
-    N = len(A)
+    cell = np.asarray(A.get_cell())
+    positions = A.get_positions().copy()
 
-    # Build neighborlist (per-atom cutoffs)
-    nl = _build_neighborlist_for_atoms(A, cutoff_scale=cutoff_scale)
+    radii = np.asarray(
+        [float(covalent_radii[z]) if z < len(covalent_radii) else 0.7 for z in numbers]
+    )
+    nl = NeighborList(
+        (radii * cutoff_scale).tolist(),
+        self_interaction=False,
+        bothways=True,
+        skin=0.0,
+    )
+    nl.update(A)
 
-    visited = np.zeros(N, dtype=bool)
-    for start in range(N):
+    visited = np.zeros(len(A), dtype=bool)
+
+    for start in range(len(A)):
         if visited[start]:
             continue
 
-        # BFS through this connected component
         queue = [start]
         visited[start] = True
+
         while queue:
             i = queue.pop(0)
-            pi = pos[i]
+            pi = positions[i]
 
-            neighs, _ = nl.get_neighbors(i)
-            for j in neighs:
-                # Skip H-H pairs if configured
+            neighbours, offsets = nl.get_neighbors(i)
+            for nb_pos, j in enumerate(neighbours):
+                j = int(j)
+
                 if exclude_hh and numbers[i] == 1 and numbers[j] == 1:
                     continue
-
+                if not _same_molecular_site(labels, i, j):
+                    continue
                 if visited[j]:
                     continue
 
-                # For neighbor j try integer offsets in -1..1 in each cell direction
-                best_pos = None
-                best_dist = 1e9
-                for ox in (-1, 0, 1):
-                    for oy in (-1, 0, 1):
-                        for oz in (-1, 0, 1):
-                            off = np.array([ox, oy, oz], dtype=float)
-                            cand = pos[j] + off @ cell   # candidate Cartesian position
-                            d = np.linalg.norm(cand - pi)
-                            if d < best_dist:
-                                best_dist = d
-                                best_pos = cand
+                ri = float(covalent_radii[numbers[i]])
+                rj = float(covalent_radii[numbers[j]])
+                bond_cutoff = cutoff_scale * (ri + rj)
 
-                # place j at the chosen image position
-                pos[j] = best_pos
+                raw_pos = positions[j]
+                if np.linalg.norm(raw_pos - pi) <= bond_cutoff + 1e-6:
+                    best_pos = raw_pos
+                else:
+                    best_pos = raw_pos + np.asarray(offsets[nb_pos], dtype=float) @ cell
+
+                positions[j] = best_pos
                 visited[j] = True
                 queue.append(j)
 
-    # write back positions and clear PBC (unless preserve_pbc is True)
-    A.set_positions(pos)
+    A.set_positions(positions)
     if not preserve_pbc:
         A.set_pbc([False, False, False])
 
     return A
-              
-def save_as_xyz_raw(atoms_object, filename, debug_name=""):
-    """
-    Saves the structure to XYZ without any wrapping or COM-shift.
-    Writes the coordinates exactly as they are in the Atoms object.
-    """
-    symbols = atoms_object.get_chemical_symbols()
-    positions = atoms_object.positions # Cartesian coordinates
-    total_atoms = len(symbols)
 
-    with open(filename, 'w') as f:
-        f.write(f"{total_atoms}\n")
-        f.write(f"RAW State ({debug_name})\n")
-        for symbol, pos in zip(symbols, positions):
-            f.write(f"{symbol} {pos[0]:.8f} {pos[1]:.8f} {pos[2]:.8f}\n")
+
+def save_as_xyz_raw(atoms_object, filename, debug_name=""):
+    """Save coordinates exactly as stored in the ASE Atoms object."""
+    with open(filename, "w") as handle:
+        handle.write(f"{len(atoms_object)}\n")
+        handle.write(f"RAW State ({debug_name})\n")
+        for symbol, pos in zip(atoms_object.get_chemical_symbols(), atoms_object.positions):
+            handle.write(f"{symbol} {pos[0]:.8f} {pos[1]:.8f} {pos[2]:.8f}\n")
+
 
 def save_primitive_cells(primitive_configs, primitive_dir="primitive_cells"):
-    """
-    Save all primitive configurations to an xyz folder for debugging/review.
-
-    The coordinates are written exactly as stored in the Atoms objects.
-    """
+    """Write primitive configurations for debugging/review."""
     os.makedirs(primitive_dir, exist_ok=True)
 
     for i_config, atoms in enumerate(primitive_configs):
-        filename = os.path.join(
-            primitive_dir,
-            f"primitive_config_{i_config}.xyz",
-        )
         save_as_xyz_raw(
             atoms,
-            filename,
+            os.path.join(primitive_dir, f"primitive_config_{i_config}.xyz"),
             debug_name=f"primitive_config_{i_config}",
         )
 
-    logger.info(
-        "Wrote %d primitive configurations to %s",
-        len(primitive_configs),
-        os.path.abspath(primitive_dir),
-    )
+    logger.info("Wrote %d primitive configurations to %s", len(primitive_configs), os.path.abspath(primitive_dir))
+
 
 def binary_to_idx(config, maxgroups):
     return sum([j * (maxgroups**i) for i, j in list(enumerate(reversed(config)))])
+
+def idx_to_config(index, maxgroups, length):
+    """
+    Inverse of binary_to_idx().
+
+    Example for maxgroups=2, length=2:
+        0 -> (0, 0)
+        1 -> (0, 1)
+        2 -> (1, 0)
+        3 -> (1, 1)
+    """
+    index = int(index)
+
+    digits = [0] * length
+
+    for i in range(length - 1, -1, -1):
+        digits[i] = index % maxgroups
+        index //= maxgroups
+
+    if index != 0:
+        raise ValueError(
+            f"Primitive config index is too large for maxgroups={maxgroups}, "
+            f"length={length}"
+        )
+
+    return tuple(digits)
 
 
 def select_configs(config, supercell, maxgroups):
@@ -411,52 +377,65 @@ class OrderedfromDisordered:
         return [symbols, sites, tags, labels]
 
     def _get_group_config_sites(self, tag, group, group_config_symmops):
+        """
+        Apply symmetry operations to a disorder group.
+
+        Important:
+            We preserve the unwrapped fractional coordinates from the CIF.
+            This allows molecules deliberately placed partly outside [0, 1)
+            to remain on the intended side of the unit cell.
+
+            Wrapped coordinates are used only for duplicate/equivalence checks.
+        """
         sites = []
+        wrapped_sites = []
         symbols = []
         tags = []
         labels = []
-        # loop over selected symmetry operations -- apply them to the group
-        for iops, op in enumerate(group_config_symmops):
-            # g = config[iops]
-            # # Which group should we pick?
-            # # if Zprime <1 or disorder_group_labels[igroup] < 0:
-            # #     grouplabel = disorder_group_labels[igroup]
-            # # else:
-            # grouplabel = disorder_group_labels[igroup]
-            # group = assembly.get_disorder_group(grouplabel)
-            unique_positions = group.atoms.get_scaled_positions()
-            unique_symbols = group.atoms.get_chemical_symbols()
-            unique_labels = group.atoms.get_array("labels")
-            kinds = range(len(unique_symbols))
-            # loop over site in each disorder group:
-            for kind, pos in enumerate(unique_positions):
-                # apply symmetry operation
-                rot, trans = op
-                site = np.mod(np.dot(rot, pos) + trans, 1.0)
 
-                if not sites:
+        unique_positions = group.atoms.get_scaled_positions(wrap=False)
+        unique_symbols = group.atoms.get_chemical_symbols()
+        unique_labels = group.atoms.get_array("labels")
+
+        for op in group_config_symmops:
+            rot, trans = op
+
+            for kind, pos in enumerate(unique_positions):
+                # Preserve the raw transformed fractional coordinate.
+                # Do NOT np.mod this.
+                site = np.dot(rot, pos) + trans
+
+                # Use wrapped version only to detect equivalent duplicate atoms.
+                site_wrapped = np.mod(site, 1.0)
+
+                if not wrapped_sites:
                     sites.append(site)
+                    wrapped_sites.append(site_wrapped)
                     symbols.append(unique_symbols[kind])
                     tags.append(tag)
                     labels.append(unique_labels[kind])
                     continue
-                t = site - sites
-                mask = np.all(
-                    (abs(t) < self.symprec) | (abs(abs(t) - 1.0) < self.symprec), axis=1
-                )
+
+                t = site_wrapped - np.asarray(wrapped_sites)
+                t -= np.rint(t)
+
+                mask = np.all(np.abs(t) < self.symprec, axis=1)
+
                 if np.any(mask):
                     inds = np.argwhere(mask).flatten()
+
                     if len(inds) > 1:
-                        raise SpacegroupValueError(
-                            "Found multiple equivalent sites!".format()
-                        )
-                    else:
-                        pass
-                else:
-                    sites.append(site)
-                    symbols.append(unique_symbols[kind])
-                    tags.append(tag)
-                    labels.append(unique_labels[kind])
+                        raise SpacegroupValueError("Found multiple equivalent sites!")
+
+                    # Equivalent duplicate; skip adding it.
+                    continue
+
+                sites.append(site)
+                wrapped_sites.append(site_wrapped)
+                symbols.append(unique_symbols[kind])
+                tags.append(tag)
+                labels.append(unique_labels[kind])
+
         return [symbols, sites, tags, labels]
 
     def get_config(self, config, asslabel):
@@ -664,40 +643,15 @@ class OrderedfromDisordered:
                     all_configs.append(temp)
                     all_config_metadata.append(metadata)
 
-        # Decide reference: either an explicit reference or the first config
-        reference_atoms = all_configs[0]  # choose first config as canonical layout
-        cell = np.asarray(reference_atoms.get_cell())
-        cutoff_scale=1.5
-
-        # compute reference components and centroids (use same cutoff_scale as make_whole_molecule)
-        ref_comps = connected_components_indices(reference_atoms, cutoff_scale=cutoff_scale)
-        ref_centroids = component_centroids(reference_atoms, ref_comps, mass_weighted=False)
-
-        # Now align every config to reference
-        aligned_configs = []
-        for cfg in all_configs:
-            # make_whole_molecule(cfg) should already have been applied; but do it again if unsure:
-            cfg_unwrapped = make_whole_molecule(cfg, cutoff_scale=cutoff_scale, preserve_pbc=False)
-            cfg_aligned = align_components_to_reference(cfg_unwrapped, ref_centroids, cell,
-                                                        cutoff_scale=cutoff_scale, max_offset=1, mass_weighted=False)
-            aligned_configs.append(cfg_aligned)
-
-        all_configs = aligned_configs
         self.primitive_config_metadata = all_config_metadata
-        
-        if keep_primitive:
-            save_primitive_cells(
-                all_configs,
-                primitive_dir=primitive_dir,
-            )
 
         self.logger.debug(f"Generated {len(all_configs)} primitive configs")
         return all_configs
 
     def get_supercell_configs(
         self,
-        supercell,
-        maxiters=5000,
+        supercell=(1, 1, 1),
+        maxiters=512,
         exclude_ordered=False,
         random_configs=False,
         return_configs=False,
@@ -706,6 +660,7 @@ class OrderedfromDisordered:
         ratio_tolerance=0.01,
         keep_primitive=False,
         primitive_dir="primitive_cells",
+        reload_molecular_crystal=False,
     ):
         """
         loop over supercell cells,
@@ -754,6 +709,22 @@ class OrderedfromDisordered:
             keep_primitive=keep_primitive,
             primitive_dir=primitive_dir,
         )
+        
+        self.component_labels = sorted(
+            {
+                component
+                for metadata in self.primitive_config_metadata
+                for component in metadata.get("components", {})
+            },
+            key=lambda x: int(x[1:]) if re.fullmatch(r"A\d+", str(x)) else str(x),
+        )
+
+        self.logger.info(
+            "Component labels for ratio filtering: %s",
+            self.component_labels,
+        )
+        
+        self.raw_group_labels = self._raw_group_labels()
         nimages_prim = len(self.images)
         if self.disordered_structure.molecular_crystal:
             self.logger.debug(f"Reloading {nimages_prim} images as molecular crystals")
@@ -768,8 +739,25 @@ class OrderedfromDisordered:
                 )
                 cheap_method = True
 
-            self.images = reload_as_molecular_crystal(self.images, cheap=cheap_method)
+            if reload_molecular_crystal:
+                try:
+                    self.images = reload_as_molecular_crystal(
+                        self.images,
+                        cheap=cheap_method,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "Skipping reload_as_molecular_crystal because generated images "
+                        "do not match a common molecular selection: %r",
+                        exc,
+                    )
         ########################################
+
+        if keep_primitive:
+            save_primitive_cells(
+                self.images,
+                primitive_dir=primitive_dir,
+            )
 
         # some aliases
         Z = self.disordered_structure.Z
@@ -789,29 +777,42 @@ class OrderedfromDisordered:
         )
 
         options = list(range(self.ndisordergroups))
-        size = Z * na * nb * nc
-        if random_configs:
-            all_combinations = random_product(options, repeat=size)
-        else:
-            # this iterator generates all
-            # possible lists of e.g. 0s and 1s etc of length Z*na*nb*nc
-            all_combinations = itertools.product(options, repeat=size)
+
+        n_primitive_cells = na * nb * nc
+        n_raw_slots = Z * n_primitive_cells
 
         if fix_ratio:
-            # we will generate configs with a fixed ratio of ordered to disordered
-            # we will do this by generating a random list of 0s and 1s
-            # and then sorting them by the number of 1s they have
-            # this should give us a list of configs with a roughly fixed ratio
-            # of ordered to disordered
-            # we will then take the first n_configs of these
             self.ratio = self._process_ratio(ratio)
             self.logger.info(f"Fixing ratio to {self.ratio}")
 
-            # filter all_combinations by the ratio
-            # all_combinations = self._ratio_filter(all_combinations, ratio)
+            target_ratio = np.asarray(self.ratio[0], dtype=float)
 
-            # apply filter to all_combinations
-            all_combinations = filter(self._ratio_filter, all_combinations)
+            use_direct_component_sampling = (
+                random_configs
+                and hasattr(self, "component_labels")
+                and len(target_ratio) == len(self.component_labels)
+            )
+        else:
+            use_direct_component_sampling = False
+
+        if use_direct_component_sampling:
+            all_combinations = self._random_component_ratio_configs(
+                target_ratio=target_ratio,
+                n_primitive_cells=n_primitive_cells,
+                n_configs=maxiters,
+            )
+
+        elif random_configs:
+            all_combinations = random_product(options, repeat=n_raw_slots)
+
+            if fix_ratio:
+                all_combinations = filter(self._ratio_filter, all_combinations)
+
+        else:
+            all_combinations = itertools.product(options, repeat=n_raw_slots)
+
+            if fix_ratio:
+                all_combinations = filter(self._ratio_filter, all_combinations)
 
         # how many configs to actually generate:
         if random_configs:
@@ -888,6 +889,7 @@ class OrderedfromDisordered:
             
         self.supercell_config_metadata = all_supercell_metadata
         
+        
         if return_configs:
             return all_supercells, all_configs
         return all_supercells
@@ -895,115 +897,376 @@ class OrderedfromDisordered:
 
     def _process_ratio(self, ratio):
         """
-        Process the ratio argument
+        Process the ratio argument.
+
+        Supported forms:
+            None
+                use CIF group occupancies
+
+            0.75
+                legacy binary mode -> [[0.75, 0.25]]
+
+            [0.5, 0.25, 0.25]
+                explicit ratio vector
+
+            [[...], [...]]
+                explicit per-assembly ratio vectors
         """
         if ratio is None:
-            # use the group occupancies
             ratio = [
                 [g.occupancy for g in ass.disorder_groups]
                 for ass in self.disordered_structure.disorder_assemblies
             ]
-        elif isinstance(ratio, float):
-            # use the specified ratio
-            # if only one float, then assume one assembly, two groups
-            ratio = [[ratio, 1 - ratio]]
+
+        elif isinstance(ratio, (float, int, np.floating, np.integer)):
+            ratio = [[float(ratio), 1.0 - float(ratio)]]
+
+        elif isinstance(ratio, np.ndarray):
+            ratio = ratio.tolist()
+
         elif isinstance(ratio, (list, tuple)):
-            if isinstance(ratio[0], float):
-                # use the specified ratios. Assume just one assembly
-                ratio = [ratio]
-            elif isinstance(ratio[0], int):
-                # assume this is a list of integers, with the occupancies being
-                # computed from the ratio.
-                # use the specified ratios. Assume just one assembly
-                ratio = [ratio / ratio.sum()]
+            ratio = list(ratio)
 
-            elif isinstance(ratio[0], list):
-                # use the specified ratios as provided
-                ratio = ratio
+            if len(ratio) == 1 and isinstance(
+                ratio[0],
+                (float, int, np.floating, np.integer),
+            ):
+                value = float(ratio[0])
+                ratio = [[value, 1.0 - value]]
+
+            elif all(
+                isinstance(value, (float, int, np.floating, np.integer))
+                for value in ratio
+            ):
+                values = np.asarray(ratio, dtype=float)
+
+                if values.sum() <= 0:
+                    raise ValueError(f"Ratio values sum to zero: {ratio}")
+
+                if not np.isclose(values.sum(), 1.0):
+                    values = values / values.sum()
+
+                ratio = [values.tolist()]
+
+            elif isinstance(ratio[0], (list, tuple, np.ndarray)):
+                ratio = [
+                    np.asarray(inner, dtype=float).tolist()
+                    for inner in ratio
+                ]
+
             else:
-                raise ValueError("ratio must be a float, int or list")
+                raise ValueError("ratio must be a float, list of floats, or list of lists")
+
         else:
-            raise ValueError("ratio must be a float, int or list")
-        # convert to np arrays
-        ratio = np.array(ratio)
-        return ratio
+            raise ValueError("ratio must be a float, list of floats, or list of lists")
 
-    def _ratio_filter(self, config):
+        return np.asarray(ratio, dtype=float)
+
+    def _primitive_component_vectors(self):
         """
-        Returns True if the config matches the ratio
+        Return component count vectors for each primitive configuration.
 
-        TODO: test/make this work for multiple assemblies!
+        Example with component_labels ['A1', 'A2']:
+            primitive config 0 -> (2, 0)
+            primitive config 1 -> (1, 1)
+            primitive config 8 -> (0, 2)
         """
+        vectors = []
 
-        computed_ratio = np.bincount(config, minlength=self.ndisordergroups)
-        computed_ratio = computed_ratio / computed_ratio.sum()
+        for metadata in self.primitive_config_metadata:
+            counts = metadata.get("components", {})
 
-        # flatten ratio array -- this this might not work for multiple assemblies
-        ratio = self.ratio
-        if len(ratio) > 1:
-            raise NotImplementedError(
-                "ratio filtering not implemented for multiple assemblies"
+            vectors.append(
+                tuple(
+                    int(counts.get(component, 0))
+                    for component in self.component_labels
+                )
             )
 
-        ratio = ratio[0]
+        return vectors
 
-        # check if the computed ratio is within self.ratio_tolerance of the desired ratio
-        if np.allclose(ratio, computed_ratio, atol=self.ratio_tolerance):
-            return True
 
-        return False
+    def _target_counts_from_ratio(self, target_ratio, n_primitive_cells):
+        """
+        Convert a target component ratio into integer component counts.
 
-        # return filtered_combination
+        n_primitive_cells is na * nb * nc.
+        """
+        vectors = self._primitive_component_vectors()
+
+        sites_per_primitive = sum(vectors[0])
+        total_sites = int(n_primitive_cells * sites_per_primitive)
+
+        target_ratio = np.asarray(target_ratio, dtype=float)
+
+        if target_ratio.sum() <= 0:
+            raise ValueError(f"Target ratio sums to zero: {target_ratio}")
+
+        target_ratio = target_ratio / target_ratio.sum()
+
+        raw = target_ratio * total_sites
+
+        counts = np.floor(raw).astype(int)
+        remaining = total_sites - int(counts.sum())
+
+        remainders = raw - counts
+        order = np.argsort(remainders)[::-1]
+
+        for idx in order[:remaining]:
+            counts[idx] += 1
+
+        self.logger.info(
+            "Target component counts for %d primitive cells / %d sites: %s",
+            n_primitive_cells,
+            total_sites,
+            dict(zip(self.component_labels, counts)),
+        )
+
+        return tuple(int(x) for x in counts)
+
+
+    def _random_config_with_component_counts(self, target_counts, n_primitive_cells, rng):
+        """
+        Generate one random raw group-state config with exact component counts.
+
+        The internal dynamic-programming step chooses primitive configuration
+        indices, but the returned config is converted back to the old raw
+        group-state representation expected by get_supercell_config().
+        """
+        vectors = self._primitive_component_vectors()
+        n_components = len(self.component_labels)
+
+        target_counts = tuple(int(x) for x in target_counts)
+
+        @lru_cache(None)
+        def feasible(cells_left, remaining):
+            remaining = tuple(remaining)
+
+            if cells_left == 0:
+                return all(x == 0 for x in remaining)
+
+            for vector in vectors:
+                new_remaining = tuple(
+                    remaining[i] - vector[i]
+                    for i in range(n_components)
+                )
+
+                if any(x < 0 for x in new_remaining):
+                    continue
+
+                if feasible(cells_left - 1, new_remaining):
+                    return True
+
+            return False
+
+        if not feasible(n_primitive_cells, target_counts):
+            raise ValueError(
+                "Could not build a supercell configuration with the requested "
+                f"component counts {dict(zip(self.component_labels, target_counts))}. "
+                "Try a larger supercell or a composition that is representable."
+            )
+
+        raw_config = []
+        remaining = target_counts
+
+        for cells_left in range(n_primitive_cells, 0, -1):
+            choices = []
+
+            for primitive_index, vector in enumerate(vectors):
+                new_remaining = tuple(
+                    remaining[i] - vector[i]
+                    for i in range(n_components)
+                )
+
+                if any(x < 0 for x in new_remaining):
+                    continue
+
+                if feasible(cells_left - 1, new_remaining):
+                    choices.append((primitive_index, new_remaining))
+
+            choice_index = int(rng.integers(len(choices)))
+            primitive_index, remaining = choices[choice_index]
+
+            primitive_digits = idx_to_config(
+                primitive_index,
+                maxgroups=self.ndisordergroups,
+                length=self.disordered_structure.Z,
+            )
+
+            raw_config.extend(primitive_digits)
+
+        return tuple(raw_config)
+
+
+    def _random_component_ratio_configs(self, target_ratio, n_primitive_cells, n_configs):
+        """
+        Yield random raw group-state configs matching a component-level ratio exactly.
+        """
+        rng = np.random.default_rng()
+
+        target_counts = self._target_counts_from_ratio(
+            target_ratio=target_ratio,
+            n_primitive_cells=n_primitive_cells,
+        )
+
+        self.logger.info(
+            "Directly generating random configs with component counts %s",
+            dict(zip(self.component_labels, target_counts)),
+        )
+
+        for _ in range(n_configs):
+            yield self._random_config_with_component_counts(
+                target_counts=target_counts,
+                n_primitive_cells=n_primitive_cells,
+                rng=rng,
+            )
+    
+    
+    def _ratio_filter(self, config):
+        """
+        Return True if the config matches the requested ratio.
+
+        Preferred mode:
+            ratio length == number of chemical components, e.g. A1/A2
+
+        Legacy mode:
+            ratio length == number of primitive disorder configuration states
+        """
+        ratio = self.ratio
+
+        if len(ratio) > 1:
+            raise NotImplementedError(
+                "ratio filtering not implemented for multiple per-assembly ratio arrays"
+            )
+
+        target_ratio = np.asarray(ratio[0], dtype=float)
+
+        if target_ratio.sum() <= 0:
+            raise ValueError(f"Target ratio sums to zero: {target_ratio}")
+
+        target_ratio = target_ratio / target_ratio.sum()
+
+        # New preferred mode: component-level composition, e.g. A1/A2.
+        if hasattr(self, "component_labels") and len(target_ratio) == len(self.component_labels):
+            primitive_indices = select_configs(
+                config,
+                supercell=self.supercell,
+                maxgroups=self.ndisordergroups,
+            )
+
+            component_counts = Counter()
+
+            for primitive_index in primitive_indices:
+                component_counts.update(
+                    self.primitive_config_metadata[int(primitive_index)]["components"]
+                )
+
+            values = np.asarray(
+                [
+                    component_counts.get(component, 0)
+                    for component in self.component_labels
+                ],
+                dtype=float,
+            )
+
+            if values.sum() <= 0:
+                return False
+
+            computed_ratio = values / values.sum()
+
+        # Legacy mode: ratio over primitive configuration indices.
+        elif len(target_ratio) == self.ndisordergroups:
+            computed_ratio = np.bincount(
+                config,
+                minlength=self.ndisordergroups,
+            ).astype(float)
+
+            computed_ratio = computed_ratio / computed_ratio.sum()
+
+        else:
+            raise ValueError(
+                "Ratio length does not match orgdisord state space. "
+                f"Got ratio length {len(target_ratio)}. "
+                f"Component labels are {getattr(self, 'component_labels', None)}. "
+                f"Primitive-state length is {self.ndisordergroups}."
+            )
+
+        return np.allclose(
+            target_ratio,
+            computed_ratio,
+            atol=self.ratio_tolerance,
+        )
 
     def get_supercell_config(self, config) -> Atoms:
         """
-        get a supercell config
+        Build a supercell from pre-aligned primitive molecular images.
 
-        Args:
-            config (np.array): array of integers of length Z*na*nb*nc
-                                (where Z is the number of sites in the primitive cell
-                                and na, nb, nc are the supercell sizes)
-
+        Do not atom-wise wrap primitive cells here. The primitive images already
+        contain whole molecules in the intended periodic image.
         """
         na, nb, nc = self.supercell
-        cell = self.cell
+        cell = np.asarray(self.cell)
         ndisordergroups = self.ndisordergroups
-        
+
         transformation_matrix = np.diag([na, nb, nc])
         supercell_matrix = transformation_matrix @ cell
 
         supercell_atoms = Atoms(cell=supercell_matrix, pbc=True)
+
         for icell, c in enumerate(
-            select_configs(config, supercell=self.supercell, maxgroups=ndisordergroups)
+            select_configs(
+                config,
+                supercell=self.supercell,
+                maxgroups=ndisordergroups,
+            )
         ):
-            # make a copy of prim config c
-            temp = self.images[c].copy()
-            
-            # ensure wrapped into primitive cell first
-            temp.wrap() 
-            temp = make_whole_molecule(temp, preserve_pbc=True)
-            
-            # work out what the translation vector should be:
-            # amended to be consistant with select
+            temp = self.images[int(c)].copy()
+
+            # Do not call temp.wrap().
+            # Do not call make_whole_molecule() here.
+            # The primitive image should already be whole and correctly placed.
+            temp.set_cell(cell)
+            temp.set_pbc(True)
+
             ic = icell % nc
             ib = (icell // nc) % nb
             ia = icell // (nc * nb)
-            R = cell.T.dot([ia, ib, ic])
-            # translate primitive copy to correct place
+
+            R = np.asarray([ia, ib, ic], dtype=float) @ cell
+
             temp.translate(R)
-            # add this block into the supercell
             supercell_atoms.extend(temp)
+
         return supercell_atoms
     
     def _component_label(self, asslabel, group):
         """
-        Generic component label based on CIF disorder assembly/group.
+        Return the chemical component label for a disorder group.
 
-        Examples:
-            assembly A, group 1 -> A1
-            assembly A, group 2 -> A2
-            assembly B, group 1 -> B1
+        This uses atom labels written by cspy-disord prepare-cif, e.g.
+
+            A1_S001_C1   -> A1
+            A2_S001_C1   -> A2
+            A2m2_S001_C1 -> A2
+
+        If this fails, fall back to the raw assembly/group label.
         """
+        try:
+            labels = group.atoms.get_array("labels")
+
+            if len(labels) > 0:
+                prefix = str(labels[0]).split("_")[0]
+
+                match = re.match(r"(A\d+)", prefix)
+
+                if match:
+                    return match.group(1)
+
+                return prefix
+
+        except Exception:
+            pass
+
         return f"{asslabel}{group.label}"
 
     def _component_counts_for_config(self, config, asslabel):
@@ -1029,3 +1292,22 @@ class OrderedfromDisordered:
             counts[label] += 1
 
         return dict(counts)
+
+    def _raw_group_labels(self):
+        """
+        Return raw disorder group labels in CIF assembly/group order.
+
+        Example:
+            S001 group 1 -> S0011
+            S001 group 2 -> S0012
+            S002 group 1 -> S0021
+        """
+        labels = []
+
+        for assembly in self.disordered_structure.disorder_assemblies:
+            for group in assembly.disorder_groups:
+                labels.append(
+                    self._component_label(assembly.label, group)
+                )
+
+        return labels

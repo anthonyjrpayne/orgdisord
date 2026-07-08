@@ -1,5 +1,6 @@
 """Console script for orgdisord."""
 import sys
+import re
 import os
 import json
 import click
@@ -95,6 +96,46 @@ def write_enumeration_manifest(
         json.dump(_json_safe(manifest), handle, indent=2)
 
     return manifest_path
+
+def natural_key(text):
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", str(text))
+    ]
+
+
+def sort_atoms_by_labels(atoms):
+    """
+    Deterministically reorder atoms using their labels.
+
+    This changes only atom order, not geometry.
+    It helps CSPy/DMACRYS match generated structures to the DMA molecules.
+    """
+    if not atoms.has("labels"):
+        return atoms
+
+    labels = atoms.get_array("labels").astype(str)
+
+    def label_key(label):
+        parts = str(label).split("_")
+
+        component = parts[0] if len(parts) > 0 else ""
+        site = parts[1] if len(parts) > 1 else ""
+        atom = parts[-1] if len(parts) > 0 else str(label)
+
+        return (
+            natural_key(site),
+            natural_key(component),
+            natural_key(atom),
+            natural_key(label),
+        )
+
+    order = sorted(
+        range(len(atoms)),
+        key=lambda i: label_key(labels[i]),
+    )
+
+    return atoms[order]
 
 
 @click.group()
@@ -235,13 +276,13 @@ def cli():
 # manually specify ratios
 @click.option(
     "--ratio",
-    nargs=1,
     type=click.FLOAT,
-    default=None,
-    help="Manually specify the ratio of the disorder groups. "
-    "Must be used with --fix-ratio."
-    "e.g. --ratio 0.75 would constrain the ratios of disorder group 1 and 2 to be 3:1"
-    "NOTE: This is only implemented for 1-assembly, 2-group structures.",
+    multiple=True,
+    default=(),
+    help=(
+        "Manually specify component ratios. Can be repeated, e.g. "
+        "--ratio 0.9 --ratio 0.1 for A1:A2 = 90:10."
+    ),
 )
 # ratio tolerance
 @click.option(
@@ -385,6 +426,14 @@ def main(
 
     symops = disordered_structure.spacegroup.get_symop()
     logger.info("Enumerating ordered configurations.")
+    
+    if ratio == ():
+        ratio = None
+    elif len(ratio) == 1:
+        ratio = float(ratio[0])
+    else:
+        ratio = [float(value) for value in ratio]
+    
     # enumerate ordered configurations
     od = OrderedfromDisordered(disordered_structure, quiet=quiet)
     images, configs = od.get_supercell_configs(
@@ -398,6 +447,7 @@ def main(
         ratio_tolerance=ratio_tol,
         keep_primitive=keep_primitive,
         primitive_dir="primitive_cells",
+        reload_molecular_crystal=False,
     )
     
     image_metadata = getattr(
@@ -468,9 +518,17 @@ def main(
         stop = time.time()
         duration = stop - start
         logger.info(f"Merging took {duration:8.2f} s and found {len(groups)} groups")
-        unique_spacegroups = [spglib.get_spacegroup(atoms_to_spglib_cell(g[0])) for g in groups]
+        unique_spacegroups = [
+            spglib.get_spacegroup(
+                atoms_to_spglib_cell(g[0]),
+                symprec=symprec,
+            )
+            for g in groups
+        ]
+
         for sg, g in zip(unique_spacegroups, groups):
-            logger.info(f"Spacegroup: {sg:<20} multiplicity: {g[1]}")
+            sg_label = str(sg) if sg is not None else "Unknown"
+            logger.info(f"Spacegroup: {sg_label:<20} multiplicity: {g[1]}")
 
         # overwrite images with merged images
         images = [g[0] for g in groups]
@@ -548,6 +606,8 @@ def main(
         written_files = []
 
         for i, image in enumerate(images):
+            image = sort_atoms_by_labels(image)
+
             filename = f"{prefix}-{str(i).zfill(nleading_zeros)}.{format}"
             output_path = os.path.join(directory, filename)
             kwargs = {}
