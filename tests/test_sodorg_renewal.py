@@ -53,11 +53,29 @@ def test_enumerator(cif):
 
 
 def test_command_line_interface():
-    """Test the CLI."""
+    """Test the orgdisord Click command group and enumerate subcommand."""
     runner = CliRunner()
-    result = runner.invoke(cli.main)
-    assert result.exit_code == 0
-    assert "orgdisord.cli.main" in result.output
-    help_result = runner.invoke(cli.main, ["--help"])
-    assert help_result.exit_code == 0
-    assert "--help  Show this message and exit." in help_result.output
+    result = runner.invoke(
+        cli.cli,
+        ["--help"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "enumerate" in result.output
+    assert "analyse" in result.output
+    enumerate_help = runner.invoke(
+        cli.cli,
+        ["enumerate", "--help"],
+    )
+    assert enumerate_help.exit_code == 0, enumerate_help.output
+    assert "--supercell" in enumerate_help.output
+    assert "--maxiters" in enumerate_help.output
+    no_files = runner.invoke(
+        cli.cli,
+        ["enumerate"],
+    )
+    assert no_files.exit_code != 0
+    assert isinstance(no_files.exception, ValueError)
+    assert (
+        "Expected 1 or 2 files, got 0."
+        in str(no_files.exception)
+    )

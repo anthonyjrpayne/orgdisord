@@ -1,16 +1,11 @@
 """Module to enumerate ordered structures given a cif object containing disorder information."""
 import numpy as np
-import os
-from ase.neighborlist import natural_cutoffs, NeighborList
+from ase.neighborlist import NeighborList
 from ase.spacegroup.spacegroup import SpacegroupValueError
 from ase import Atoms, Atom
 from ase.data import covalent_radii
-from ase.geometry import get_duplicate_atoms
-from soprano.properties.linkage import Molecules
-from collections import Counter
 import itertools
 from tqdm import tqdm
-from scipy.spatial.distance import pdist
 import logging
 from orgdisord.utils import reload_as_molecular_crystal, random_product
 
@@ -247,45 +242,12 @@ def save_as_xyz_raw(atoms_object, filename, debug_name=""):
         f.write(f"RAW State ({debug_name})\n")
         for symbol, pos in zip(symbols, positions):
             f.write(f"{symbol} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f}\n")
-    # print(f"WROTE: {os.path.abspath(filename)}")
 
 
-def binary_to_idx(config, maxgroups):
-    return sum([j * (maxgroups**i) for i, j in list(enumerate(reversed(config)))])
 
 
-def select_configs(config, supercell, maxgroups):
-    """
-    from the supercell config, return indices of each
-    component primitive cell
-    e.g.
-    a 2x2x1 supercell of a Z=4 system
-    would have configs of length 16.
-    This function chunks them into 4
-    sets of 4 and returns the integer representation
-    (0-15) of each 'binary' number.
-    So for example:
-    [1,1,1,1, 0,0,0,0, 1,1,0,0, 0,0,0,1]
-    would return
-    [15, 0, 12, 1]
-
-    """
-    na, nb, nc = supercell
-    nsuper = na * nb * nc
-    chunk = len(config) // nsuper
-    # should equal Z
-    return [binary_to_idx(c, maxgroups) for c in chunks(config, chunk)]
 
 
-def chunks(lst, n, offset=0):
-    """Yield successive n-sized chunks from lst."""
-    if offset != 0:
-        # rotate copy of list by offset
-        temp = lst[offset:] + lst[:offset]
-    else:
-        temp = lst
-    for i in np.arange(0, len(lst), n):
-        yield temp[i : i + n]
 
 
 class OrderedfromDisordered:
@@ -448,16 +410,9 @@ class OrderedfromDisordered:
         """Generate all possible configs for the primitive cell and return them as
         absolute-cartesian, unwrapped ASE Atoms objects (NOT wrapped into [0,1)).
         """
-        # Create a folder for debug output (unchanged)
-        debug_dir = "debug_configs"
-        os.makedirs(debug_dir, exist_ok=True)
-        
-        print(debug_dir)
-
         cell = self.disordered_structure.cell
         Z = self.disordered_structure.Z
         # Zprime = self.cif.Zprime
-        nops_all = self.disordered_structure.spacegroup.nsymop
         nassemblies = self.disordered_structure.get_number_of_assemblies()
         correlated_assemblies = self.disordered_structure.correlated_assemblies
 
@@ -503,7 +458,7 @@ class OrderedfromDisordered:
                 nconfigs = np.product(nconfigs_per_assembly)
         self.logger.debug(f"Generating {nconfigs} configs in primitive cell.")
         if nconfigs > 1e4:
-            self.logger.warn(
+            self.logger.warning(
                 f"Warning: {nconfigs} is a large number of configs. "
                 "This may take a while!"
             )
@@ -531,7 +486,7 @@ class OrderedfromDisordered:
             #     assert 1/Zprime >= ngroups
 
             #     ngroups = int(1 / Zprime)
-            #     self.logger.warn(f'Special case for nops != Z. (i.e. Zprime < 1)'
+            #     self.logger.warning(f'Special case for nops != Z. (i.e. Zprime < 1)'
             #         f'nops = {nops_all} '
             #         f'Z = {Z}, '
             #         f'Zprime = {Zprime}\n'
@@ -587,12 +542,6 @@ class OrderedfromDisordered:
                     temp = make_whole_molecule(temp, preserve_pbc=False)
                     all_configs.append(temp)
 
-        # # Save debug xyzs of the resulting primitive configs for debugging
-        # for i_config, tmp in enumerate(all_configs):
-        #     filename = os.path.join(debug_dir, f"primitive_config_{i_config}.xyz")
-        #     save_as_xyz_raw(tmp, filename, debug_name=f"Config {i_config} (raw, unwrapped)")
-
-
         # Decide reference: either an explicit reference or the first config
         reference_atoms = all_configs[0]  # choose first config as canonical layout
         cell = np.asarray(reference_atoms.get_cell())
@@ -613,11 +562,6 @@ class OrderedfromDisordered:
 
         all_configs = aligned_configs
         
-        # # Save debug xyzs of the resulting primitive configs for debugging
-        # for i_config, tmp in enumerate(all_configs):
-        #     filename = os.path.join(debug_dir, f"primitive_config_{i_config}_aligned.xyz")
-        #     save_as_xyz_raw(tmp, filename, debug_name=f"Config_{i_config}_aligned.xyz")
-
         self.logger.debug(f"Generated {len(all_configs)} primitive configs")
         return all_configs
 
@@ -668,7 +612,7 @@ class OrderedfromDisordered:
         self.logger.debug("Pre-computing all primitive configurations...")
         self.ratio_tolerance = ratio_tolerance
         if ratio and not fix_ratio:
-            self.logger.warn(
+            self.logger.warning(
                 "Warning! ratio is specified but fix_ratio is False. Ignoring ratio."
             )
 
@@ -681,7 +625,7 @@ class OrderedfromDisordered:
             cheap_method = False
             if nimages_prim > 256:
                 # this seems to be get pretty slow for large numbers of images
-                self.logger.warn(
+                self.logger.warning(
                     "Warning: reloading molecular crystals is slow for this many images.\n"
                     "Consider skipping this step with the --not_molecular_crystal flag!\n"
                     "We will use a cheaper method to reload the images as molecular crystals instead\n"
@@ -743,7 +687,7 @@ class OrderedfromDisordered:
             # maxiters and ncombinations
             n_configs = min([maxiters, ncombinations])
             if n_configs < ncombinations:
-                self.logger.warn(
+                self.logger.warning(
                     f"""
                 Warning: maxiters ({maxiters}) is smaller than the total number of configs ({ncombinations})
                 We will only generate {n_configs} configs.
@@ -768,14 +712,14 @@ class OrderedfromDisordered:
                 break
             # make ncells copies of the relevant config
             self.logger.debug(f"         {config}")
-            all_supercells.append(self.get_supercell_config(config))
-            # TODO
-            # check for overlapping atoms
-            # cutoff = 0.25
-            # dists = pdist(supercell_atoms.get_positions(), 'sqeuclidean')
-            # if (dists < cutoff**2).any():
-            #     continue
-            # else:
+            primitive_indices = self._primitive_indices_from_group_choices(
+                config
+            )
+            all_supercells.append(
+                self.build_supercell_from_primitive_indices(
+                    primitive_indices
+                )
+            )
             all_configs.append(config)
 
         if fix_ratio:
@@ -848,42 +792,180 @@ class OrderedfromDisordered:
 
         # return filtered_combination
 
-    def get_supercell_config(self, config) -> Atoms:
+    def _primitive_indices_from_group_choices(self, config):
         """
-        get a supercell config
+        Convert legacy disorder-group choices into primitive-image indices.
 
-        Args:
-            config (np.array): array of integers of length Z*na*nb*nc
-                                (where Z is the number of sites in the primitive cell
-                                and na, nb, nc are the supercell sizes)
+        This private compatibility method is used only by the public
+        :meth:`get_supercell_configs` workflow. CSPy can bypass it and pass
+        primitive-image indices directly to
+        :meth:`build_supercell_from_primitive_indices`.
 
+        Parameters
+        ----------
+        config : iterable of int
+            Flat disorder-group choices. There must be ``Z`` choices for each
+            primitive-cell position in the supercell.
+
+        Returns
+        -------
+        list of int
+            One primitive-configuration index for each supercell position.
         """
-        na, nb, nc = self.supercell
-        cell = self.cell
-        ndisordergroups = self.ndisordergroups
-        
+        na, nb, nc = (int(value) for value in self.supercell)
+        number_of_cells = na * nb * nc
+        choices = [int(value) for value in config]
+
+        if number_of_cells <= 0:
+            raise ValueError(
+                f"Invalid supercell dimensions: {self.supercell}."
+            )
+
+        if len(choices) % number_of_cells != 0:
+            raise ValueError(
+                "The disorder-group configuration cannot be divided evenly "
+                f"between {number_of_cells} supercell positions: "
+                f"received {len(choices)} values."
+            )
+
+        choices_per_cell = len(choices) // number_of_cells
+        expected_choices_per_cell = int(self.disordered_structure.Z)
+
+        if choices_per_cell != expected_choices_per_cell:
+            raise ValueError(
+                "Expected one disorder-group choice for each primitive-cell "
+                f"site: expected Z={expected_choices_per_cell}, received "
+                f"{choices_per_cell} choices per cell."
+            )
+
+        number_of_groups = int(self.ndisordergroups)
+        if number_of_groups <= 0:
+            raise ValueError(
+                "The number of disorder groups must be positive."
+            )
+
+        primitive_indices = []
+
+        for start in range(0, len(choices), choices_per_cell):
+            cell_choices = choices[start : start + choices_per_cell]
+            primitive_index = 0
+
+            for choice in cell_choices:
+                if choice < 0 or choice >= number_of_groups:
+                    raise ValueError(
+                        "Disorder-group choice is outside the valid range "
+                        f"0 to {number_of_groups - 1}: {choice}."
+                    )
+
+                primitive_index = (
+                    primitive_index * number_of_groups + choice
+                )
+
+            primitive_indices.append(primitive_index)
+
+        return primitive_indices
+
+    def build_supercell_from_primitive_indices(
+        self,
+        primitive_indices,
+    ) -> Atoms:
+        """
+        Assemble a supercell from pre-generated primitive configurations.
+
+        Parameters
+        ----------
+        primitive_indices : iterable of int
+            One index into ``self.images`` for every primitive-cell position
+            in ``self.supercell``. Cell ordering is c-fastest, followed by b,
+            then a.
+
+        Returns
+        -------
+        ase.Atoms
+            The assembled supercell.
+
+        Notes
+        -----
+        The primitive configurations must already contain whole molecules in
+        consistent periodic images. This method therefore does not wrap atoms
+        and does not reconstruct molecules.
+        """
+        if not hasattr(self, "images") or len(self.images) == 0:
+            raise RuntimeError(
+                "Primitive configurations have not been generated. "
+                "Call get_all_configs() first."
+            )
+
+        if not hasattr(self, "supercell"):
+            raise RuntimeError(
+                "The supercell dimensions have not been set."
+            )
+
+        if not hasattr(self, "cell"):
+            raise RuntimeError(
+                "The primitive-cell matrix has not been set."
+            )
+
+        na, nb, nc = (int(value) for value in self.supercell)
+        number_of_cells = na * nb * nc
+        primitive_indices = [
+            int(index)
+            for index in primitive_indices
+        ]
+
+        if number_of_cells <= 0:
+            raise ValueError(
+                f"Invalid supercell dimensions: {self.supercell}."
+            )
+
+        if len(primitive_indices) != number_of_cells:
+            raise ValueError(
+                "Expected one primitive-configuration index for every "
+                f"supercell position: expected {number_of_cells}, received "
+                f"{len(primitive_indices)}."
+            )
+
+        number_of_images = len(self.images)
+        invalid_indices = sorted(
+            {
+                index
+                for index in primitive_indices
+                if index < 0 or index >= number_of_images
+            }
+        )
+
+        if invalid_indices:
+            raise IndexError(
+                "Primitive-configuration indices are outside the valid "
+                f"range 0 to {number_of_images - 1}: {invalid_indices}."
+            )
+
+        primitive_cell = np.asarray(self.cell, dtype=float)
         transformation_matrix = np.diag([na, nb, nc])
-        supercell_matrix = transformation_matrix @ cell
-
+        supercell_matrix = transformation_matrix @ primitive_cell
         supercell_atoms = Atoms(cell=supercell_matrix, pbc=True)
-        for icell, c in enumerate(
-            select_configs(config, supercell=self.supercell, maxgroups=ndisordergroups)
-        ):
-            # make a copy of prim config c
-            temp = self.images[c].copy()
-            
-            # ensure wrapped into primitive cell first
-            temp.wrap() 
-            temp = make_whole_molecule(temp, preserve_pbc=True)
-            
-            # work out what the translation vector should be:
-            # amended to be consistant with select
-            ic = icell % nc
-            ib = (icell // nc) % nb
-            ia = icell // (nc * nb)
-            R = cell.T.dot([ia, ib, ic])
-            # translate primitive copy to correct place
-            temp.translate(R)
-            # add this block into the supercell
-            supercell_atoms.extend(temp)
+
+        for cell_index, primitive_index in enumerate(primitive_indices):
+            # c changes fastest, followed by b and then a.
+            ic = cell_index % nc
+            ib = (cell_index // nc) % nb
+            ia = cell_index // (nb * nc)
+
+            translation = (
+                np.asarray([ia, ib, ic], dtype=float)
+                @ primitive_cell
+            )
+
+            image = self.images[primitive_index].copy()
+
+            # Do not wrap here. Wrapping individual atoms would undo the
+            # whole-molecule/reference-image work done in get_all_configs().
+            image.set_cell(primitive_cell)
+            image.set_pbc(False)
+            image.translate(translation)
+            supercell_atoms.extend(image)
+
+        supercell_atoms.set_cell(supercell_matrix)
+        supercell_atoms.set_pbc(True)
+
         return supercell_atoms

@@ -56,7 +56,7 @@ class CifParser:
         self.logger.debug(f"    occupancies: {occupancies_present}")
 
         if not groups_present:
-            self.logger.warn(
+            self.logger.warning(
                 f"Cif file {self.cif_file} does not "
                 "contain disorder group tags. Best practice is to use these to disambiguate disorder assemblies/groups."
             )
@@ -67,7 +67,7 @@ class CifParser:
                 )
 
         if not assemblies_present:
-            self.logger.warn(
+            self.logger.warning(
                 f"Cif file {self.cif_file} does not contain disorder assembly tags. "
                 "Best practice is to use these to disambiguate disorder assemblies/groups."
             )
@@ -88,7 +88,7 @@ class CifParser:
             occupancies = np.array(self.info["_atom_site_occupancy"])
         else:
             occupancies = np.ones(len(self.asymmetric_symbols))
-            self.logger.warn(
+            self.logger.warning(
                 "Warning: No occupancies found in CIF file. Assuming all occupancies are 1."
             )
 
@@ -151,7 +151,7 @@ class CifParser:
         # for now raise error if there are different numer of disorder groups in different assemblies
         ngroups = [len(group) for asslabel, group in self.disorder_groups.items()]
         if len(set(ngroups)) > 1:
-            self.logger.warn(
+            self.logger.warning(
                 f"Cif file {self.cif_file} contains different numbers"
                 " of disorder groups in different assemblies. We therefore assume that they are not correlated.\n"
                 "This is a bit experimental, so double check your results!"
@@ -178,7 +178,7 @@ class CifParser:
         # TODO: is there a better way to get Z?
         ## warn if _cell_formula_units_Z is not present in info dict
         if not "_cell_formula_units_z" in self.info:
-            self.logger.warn(
+            self.logger.warning(
                 f"Cif file {self.cif_file} does not contain _cell_formula_units_z tag. "
                 "Assuming Z = number of symmetry operations. "
                 "This is not correct in many cases - please edit the cif file appropriately."
@@ -235,7 +235,7 @@ class CifParser:
         # if even number of unique occupancies, we can will assume that they come in pairs that each sum to 1
         # if odd number of unique occupancies, we assume that there is one assembly with all the occupancies
         if len(unique_occupancies) % 2 != 0:
-            self.logger.warn(
+            self.logger.warning(
                 "Warning: Odd number of unique occupancies found. "
                 "Assuming that they are all part of one disorder assembly."
             )
@@ -409,7 +409,7 @@ class CifParser:
             )
 
         if "." in np.array(site_disorder_groups, dtype="U")[self.occupancies != 1]:
-            self.logger.warn(
+            self.logger.warning(
                 f"Warning: Some sites are not in a disorder group but have occupancy != 1."
             )
 
@@ -483,14 +483,14 @@ class CifParser:
     #             # we have a single asymmetric disorder group
     #             asymmetric_assembly = True
     #         else:
-    #             self.logger.warn(f'Warning: assembly {assembly_label} has just a single non-asymmetric disorder group.')
+    #             self.logger.warning(f'Warning: assembly {assembly_label} has just a single non-asymmetric disorder group.')
     #     else:
     #         if len(asymmetric_disorder_groups) > 0:
     #             # check if all the disorder group labels are negative
     #             if len(asymmetric_disorder_groups) == len(disorder_group_labels):
     #                 asymmetric_assembly = True
     #             else:
-    #                 self.logger.warn(f'Warning: assembly {assembly_label} has a mix of positive and negative disorder group labels -- not sure what to do here!' )
+    #                 self.logger.warning(f'Warning: assembly {assembly_label} has a mix of positive and negative disorder group labels -- not sure what to do here!' )
     #     return asymmetric_assembly
 
     def get_disordered_structure(self):
