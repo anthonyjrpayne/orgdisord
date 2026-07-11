@@ -11,6 +11,7 @@ from collections import Counter
 import itertools
 from tqdm import tqdm
 from scipy.spatial.distance import pdist
+from scipy.optimize import linear_sum_assignment
 import logging
 from functools import lru_cache
 from orgdisord.utils import reload_as_molecular_crystal, random_product
@@ -188,6 +189,244 @@ def make_whole_molecule(atoms, cutoff_scale=1.5, preserve_pbc=False, exclude_hh=
         A.set_pbc([False, False, False])
 
     return A
+
+
+def _component_site_label(labels, component):
+    """
+    Return the crystallographic disorder-site label for a connected molecule.
+
+    Labels prepared by CSPy look like:
+        A1_S001_C1
+        A2m1_S001_N1
+
+    Component identity and mapping may change, but S001 identifies the
+    crystallographic disorder assembly/site that the molecule belongs to.
+    """
+    sites = {
+        _split_label(labels[index])[1]
+        for index in component
+        if _split_label(labels[index])[1] is not None
+    }
+
+    if not sites:
+        return None
+
+    if len(sites) != 1:
+        raise ValueError(
+            "A connected molecular component contains atoms from more than "
+            f"one labelled disorder site: {sorted(sites)}"
+        )
+
+    return next(iter(sites))
+
+
+def _component_centroid(atoms, component):
+    """Return the Cartesian centroid of one molecular component."""
+    return atoms.get_positions()[component].mean(axis=0)
+
+
+def _components_by_site(atoms, cutoff_scale=1.5):
+    """
+    Return connected molecular components grouped by disorder-site label.
+
+    Ordered atoms or other components without an Sxxx label are not moved.
+    """
+    labels = _atoms_labels(atoms)
+    components = connected_components_indices(
+        atoms,
+        cutoff_scale=cutoff_scale,
+    )
+
+    grouped = {}
+
+    for component in components:
+        site = _component_site_label(labels, component)
+
+        if site is None:
+            continue
+
+        grouped.setdefault(site, []).append(component)
+
+    return grouped
+
+
+def _best_integer_lattice_shift(source, target, cell):
+    """
+    Return the integer lattice translation that moves source closest to target.
+
+    The small search around the fractional-coordinate estimate also works for
+    non-orthogonal cells where independently rounding each fractional
+    coordinate is not always the closest Cartesian lattice image.
+    """
+    cell = np.asarray(cell, dtype=float)
+    inverse_cell = np.linalg.inv(cell)
+
+    fractional_guess = (target - source) @ inverse_cell
+    base_shift = np.rint(fractional_guess).astype(int)
+
+    best_shift = base_shift.copy()
+    best_distance = np.inf
+
+    for offset in itertools.product((-1, 0, 1), repeat=3):
+        shift = base_shift + np.asarray(offset, dtype=int)
+        shifted_source = source + shift @ cell
+        distance = np.linalg.norm(shifted_source - target)
+
+        if distance < best_distance:
+            best_distance = distance
+            best_shift = shift
+
+    return best_shift, float(best_distance)
+
+
+def canonicalise_reference_molecular_images(
+    atoms,
+    cutoff_scale=1.5,
+):
+    """
+    Make molecules whole and place each molecular centroid in the reference
+    primitive cell.
+
+    Molecules may still extend outside the cell; only their centroid is used
+    to select the periodic image.
+    """
+    aligned = make_whole_molecule(
+        atoms,
+        cutoff_scale=cutoff_scale,
+        preserve_pbc=False,
+    )
+
+    cell = np.asarray(aligned.get_cell(), dtype=float)
+    inverse_cell = np.linalg.inv(cell)
+    positions = aligned.get_positions().copy()
+
+    components_by_site = _components_by_site(
+        aligned,
+        cutoff_scale=cutoff_scale,
+    )
+
+    for components in components_by_site.values():
+        for component in components:
+            centroid = positions[component].mean(axis=0)
+            fractional_centroid = centroid @ inverse_cell
+
+            # Put the centroid into [0, 1) without wrapping individual atoms.
+            lattice_shift = -np.floor(
+                fractional_centroid + 1.0e-12
+            ).astype(int)
+
+            positions[component] += lattice_shift @ cell
+
+    aligned.set_positions(positions)
+    aligned.set_pbc([False, False, False])
+
+    return aligned
+
+
+def align_molecular_images_to_reference(
+    atoms,
+    reference,
+    cutoff_scale=1.5,
+):
+    """
+    Translate whole molecules by integer lattice vectors so that equivalent
+    molecules occupy the same periodic images as the reference configuration.
+
+    Components are first grouped by Sxxx site label. When a site produces
+    multiple symmetry-equivalent molecules, the Hungarian assignment
+    algorithm gives a one-to-one minimum-distance matching.
+    """
+    aligned = make_whole_molecule(
+        atoms,
+        cutoff_scale=cutoff_scale,
+        preserve_pbc=False,
+    )
+
+    cell = np.asarray(aligned.get_cell(), dtype=float)
+
+    current_by_site = _components_by_site(
+        aligned,
+        cutoff_scale=cutoff_scale,
+    )
+    reference_by_site = _components_by_site(
+        reference,
+        cutoff_scale=cutoff_scale,
+    )
+
+    current_sites = set(current_by_site)
+    reference_sites = set(reference_by_site)
+
+    if current_sites != reference_sites:
+        raise ValueError(
+            "Primitive configurations do not contain the same labelled "
+            "molecular sites. "
+            f"Current={sorted(current_sites)}, "
+            f"reference={sorted(reference_sites)}"
+        )
+
+    positions = aligned.get_positions().copy()
+
+    for site in sorted(reference_sites):
+        current_components = current_by_site[site]
+        reference_components = reference_by_site[site]
+
+        if len(current_components) != len(reference_components):
+            raise ValueError(
+                f"Different numbers of molecular components for site {site}: "
+                f"current={len(current_components)}, "
+                f"reference={len(reference_components)}"
+            )
+
+        number_of_components = len(current_components)
+
+        cost_matrix = np.empty(
+            (number_of_components, number_of_components),
+            dtype=float,
+        )
+        lattice_shifts = [
+            [None for _ in range(number_of_components)]
+            for _ in range(number_of_components)
+        ]
+
+        current_centroids = [
+            positions[component].mean(axis=0)
+            for component in current_components
+        ]
+        reference_centroids = [
+            _component_centroid(reference, component)
+            for component in reference_components
+        ]
+
+        for current_index, current_centroid in enumerate(current_centroids):
+            for reference_index, reference_centroid in enumerate(
+                reference_centroids
+            ):
+                shift, distance = _best_integer_lattice_shift(
+                    source=current_centroid,
+                    target=reference_centroid,
+                    cell=cell,
+                )
+
+                cost_matrix[current_index, reference_index] = distance
+                lattice_shifts[current_index][reference_index] = shift
+
+        current_indices, reference_indices = linear_sum_assignment(
+            cost_matrix
+        )
+
+        for current_index, reference_index in zip(
+            current_indices,
+            reference_indices,
+        ):
+            component = current_components[current_index]
+            shift = lattice_shifts[current_index][reference_index]
+
+            positions[component] += shift @ cell
+
+    aligned.set_positions(positions)
+    aligned.set_pbc([False, False, False])
+
+    return aligned
 
 
 def save_as_xyz_raw(atoms_object, filename, debug_name=""):
@@ -466,187 +705,287 @@ class OrderedfromDisordered:
     def get_all_configs(
         self,
         exclude_ordered=False,
-        keep_primitive=False,
-        primitive_dir="primitive_cells",
-        ):
-        """Generate all possible configs for the primitive cell and return them as
-        absolute-cartesian, unwrapped ASE Atoms objects (NOT wrapped into [0,1)).
+    ):
         """
-
+        Generate every allowed primitive-cell disorder configuration.
+        """
         cell = self.disordered_structure.cell
         Z = self.disordered_structure.Z
-        # Zprime = self.cif.Zprime
-        nops_all = self.disordered_structure.spacegroup.nsymop
-        nassemblies = self.disordered_structure.get_number_of_assemblies()
-        correlated_assemblies = self.disordered_structure.correlated_assemblies
 
-        max_spacegroup_kinds = 0
-        # set up base atoms object to which sites will be
-        # added.
+        assemblies = list(self.disordered_structure.disorder_assemblies)
+        correlated = bool(self.disordered_structure.correlated_assemblies)
+
+        if not assemblies:
+            raise ValueError(
+                "No disorder assemblies were found."
+            )
+
+        # Base ordered structure
         if exclude_ordered:
-            # just an empty box
-            atoms = Atoms(cell=cell, pbc=True)
+            base_atoms = Atoms(cell=cell,pbc=True,)
+
         else:
-            atoms = self.disordered_structure.ordered_atoms.copy()
-            if len(atoms) > 0:
-                sg = self.disordered_structure.spacegroup
-                max_spacegroup_kinds = sg.tag_sites(atoms.get_scaled_positions()).max()
-                # give ordered sites a tag of 0
-                atoms.set_tags(0)
+            base_atoms = (self.disordered_structure.ordered_atoms.copy())
+            base_atoms.set_cell(cell)
+            base_atoms.set_pbc(True)
 
-        # what's the final number of configs we will generate?
-        # TODO generalise!
-        ngroups_per_assembly = (
-            self.disordered_structure.get_number_of_disorder_groups_per_assembly()
-        )
-        nconfigs_per_assembly = [N**Z for N in ngroups_per_assembly]
-        nconfigs = nconfigs_per_assembly[0]  # defaults to first ngroups
+            if len(base_atoms):
+                # Ordered atoms are always assigned tag zero.
+                base_atoms.set_tags(np.zeros(len(base_atoms),dtype=int,))
 
-        if correlated_assemblies:
-            if nassemblies > 1:
-                self.logger.debug(
-                    "Treating the assemblies as correlated. \n"
-                    "This means that the same index from each assembly is chosen for each configuration."
-                )
-                if len(set(nconfigs_per_assembly)) != 1:
-                    raise ValueError(
-                        "Error: the number of configurations per assembly is not the same for all assemblies.\n"
-                        "Please set correlated_assemblies to False."
-                    )
-        else:
-            if nassemblies > 1:
-                self.logger.debug(
-                    "Treating the assemblies as uncorrelated "
-                    "(i.e. the assemblies are independent) and we will therefore generate lots of structures!"
-                )
-                nconfigs = np.product(nconfigs_per_assembly)
-        self.logger.debug(f"Generating {nconfigs} configs in primitive cell.")
-        if nconfigs > 1e4:
-            self.logger.warn(
-                f"Warning: {nconfigs} is a large number of configs. "
-                "This may take a while!"
-            )
 
-        all_configs = []
-        all_config_metadata = []
-        for assembly in self.disordered_structure.disorder_assemblies:
-            asslabel = assembly.label
-            # the disorder groups for this assembly
+        # Validate assemblies and determine their actual state spaces
+        assembly_specs = []
+
+        for assembly in assemblies:
             disorder_groups = assembly.disorder_groups
-            # normally ngroups = ndisorder groups
-            ngroups = len(disorder_groups)
-            group_nops = [len(group.symmetry_operations) for group in disorder_groups]
-            self.logger.debug(f"Group n ops {group_nops}")
+            n_groups = len(disorder_groups)
 
-            if len(set(group_nops)) != 1:
+            config_max = n_groups
+
+            if config_max <= 0:
                 raise ValueError(
-                    "Error: the number of symmetry operations per group "
-                    f" is not the same for all groups in assembly {asslabel}:\n"
-                    f"{group_nops}"
+                    f"Assembly {assembly.label} has no valid "
+                    "configuration states."
                 )
 
-            # but when Zprime is less than 1, we need to be more careful!
-            # if Zprime < 1: # means more symmetry operations than we have Z
-            #     # in this case the actual number of groups (1/Zprime) will be larger than the number of disorder groups
-            #     assert 1/Zprime >= ngroups
+            n_configs = config_max ** Z
 
-            #     ngroups = int(1 / Zprime)
-            #     self.logger.warn(f'Special case for nops != Z. (i.e. Zprime < 1)'
-            #         f'nops = {nops_all} '
-            #         f'Z = {Z}, '
-            #         f'Zprime = {Zprime}\n'
-            #         'This is less well-tested so proceed with caution.'
-            #         'If you encounter any issues, please contact the developers.')
-
-            self.logger.debug(f"Assembly {asslabel} has {ngroups} groups")
-
-            if ngroups == 1:
-                # Special disorder site case with only one group
-                # -> each symmetry operation generated a new config.
-                config_max = group_nops[0]
-            else:
-                config_max = ngroups
-
-            # generate all possible configs for this assembly
-            config_indices = list(
-                itertools.product(list(range(config_max)), repeat=Z)
+            assembly_specs.append(
+                {
+                    "assembly": assembly,
+                    "config_max": config_max,
+                    "n_configs": n_configs,
+                }
             )
 
-            assembly_configs = [
-                self.get_config(config_idx, asslabel)
-                for config_idx in config_indices
-            ]
+        n_configs_per_assembly = [
+            spec["n_configs"]
+            for spec in assembly_specs
+        ]
 
-            assembly_config_metadata = [
-                {
-                    "components": self._component_counts_for_config(
-                        config_idx,
-                        asslabel,
+        # Determine the total primitive configuration count
+        if correlated and len(assembly_specs) > 1:
+            if len(set(n_configs_per_assembly)) != 1:
+                raise ValueError(
+                    "Correlated assemblies must contain the same number "
+                    "of primitive configurations. Got "
+                    f"{n_configs_per_assembly}. "
+                )
+
+            total_n_configs = n_configs_per_assembly[0]
+
+            self.logger.debug(
+                "Treating %d disorder assemblies as correlated.",
+                len(assembly_specs),
+            )
+
+        else:
+            total_n_configs = int(
+                np.prod(n_configs_per_assembly)
+            )
+
+            if len(assembly_specs) > 1:
+                self.logger.debug(
+                    "Treating %d disorder assemblies as uncorrelated.",
+                    len(assembly_specs),
+                )
+
+        self.logger.debug(
+            "Generating %d primitive-cell configurations.",
+            total_n_configs,
+        )
+
+        if total_n_configs > 10_000:
+            self.logger.warning(
+                "%d primitive-cell configurations will be generated. "
+                "This may take a while.",
+                total_n_configs,
+            )
+
+        # Generate and combine the assembly configurations
+        all_configs = []
+        all_metadata = []
+
+        for spec in assembly_specs:
+            assembly = spec["assembly"]
+
+            config_indices = itertools.product(
+                range(spec["config_max"]),
+                repeat=Z,
+            )
+
+            assembly_configs = []
+            assembly_metadata = []
+
+            for config_index in config_indices:
+                config = self.get_config(
+                    config_index,
+                    assembly.label,
+                )
+
+                metadata = {
+                    "components": (
+                        self._component_counts_for_config(
+                            config_index,
+                            assembly.label,
+                        )
                     )
                 }
-                for config_idx in config_indices
-            ]
-            # update max_spacegroup_kinds tags
-            for config in assembly_configs:
-                labels = config.get_array("labels")
-                u, spacegroup_kinds = np.unique(labels, return_inverse=True)
-                config.set_array(
-                    "spacegroup_kinds", spacegroup_kinds + max_spacegroup_kinds + 1
-                )
+
+                assembly_configs.append(config)
+                assembly_metadata.append(metadata)
+
             self.logger.debug(
-                f"Assembly {asslabel} has {len(assembly_configs)} configs"
+                "Assembly %s generated %d configurations.",
+                assembly.label,
+                len(assembly_configs),
             )
-            if all_configs:
-                if correlated_assemblies:
-                    # then just add the config atoms to the existing ones!
-                    assert len(assembly_configs) == len(all_configs)
-                    for iconfig in range(len(assembly_configs)):
-                        temp = all_configs[iconfig].copy()
-                        temp.extend(assembly_configs[iconfig])
-                        all_configs[iconfig] = temp
-                        
-                        all_config_metadata[iconfig]["components"] = (
-                            merge_component_counts(
-                                all_config_metadata[iconfig]["components"],
-                                assembly_config_metadata[iconfig]["components"],
-                            )
-                        )
-                else:
-                    ref_configs = [config.copy() for config in all_configs]
-                    ref_metadata = [dict(meta) for meta in all_config_metadata]
 
-                    all_configs = []
-                    all_config_metadata = []
-
-                    for iconfig in range(len(ref_configs)):
-                        for jconfig in range(len(assembly_configs)):
-                            temp = ref_configs[iconfig].copy()
-                            temp.extend(assembly_configs[jconfig])
-                            all_configs.append(temp)
-
-                            components = merge_component_counts(
-                                ref_metadata[iconfig]["components"],
-                                assembly_config_metadata[jconfig]["components"],
-                            )
-                            all_config_metadata.append(
-                                {"components": components}
-                            )
-            else:
-                # must the be first assembly -- all_configs is empty so let's start from scratch
-                 for config, metadata in zip(
+            # First assembly
+            if not all_configs:
+                for config, metadata in zip(
                     assembly_configs,
-                    assembly_config_metadata,
+                    assembly_metadata,
                 ):
-                    temp = atoms.copy()
-                    temp.extend(config)
-                    temp = make_whole_molecule(temp, preserve_pbc=False)
-                    all_configs.append(temp)
-                    all_config_metadata.append(metadata)
+                    combined = base_atoms.copy()
+                    combined.extend(config)
 
-        self.primitive_config_metadata = all_config_metadata
+                    all_configs.append(combined)
 
-        self.logger.debug(f"Generated {len(all_configs)} primitive configs")
-        return all_configs
+                    all_metadata.append(
+                        {
+                            "components": dict(
+                                metadata["components"]
+                            )
+                        }
+                    )
+
+                continue
+
+            # --------------------------------------------------------------
+            # Correlated assemblies
+            #
+            # Configuration i from this assembly is combined only with
+            # configuration i from the assemblies already processed.
+            # --------------------------------------------------------------
+            if correlated:
+                if len(assembly_configs) != len(all_configs):
+                    raise ValueError(
+                        "Correlated assembly configuration counts changed "
+                        "during enumeration. Existing configurations: "
+                        f"{len(all_configs)}; assembly "
+                        f"{assembly.label}: {len(assembly_configs)}."
+                    )
+
+                for index, (
+                    config,
+                    metadata,
+                ) in enumerate(
+                    zip(
+                        assembly_configs,
+                        assembly_metadata,
+                    )
+                ):
+                    all_configs[index].extend(config)
+
+                    all_metadata[index]["components"] = (
+                        merge_component_counts(
+                            all_metadata[index]["components"],
+                            metadata["components"],
+                        )
+                    )
+
+                continue
+
+            # --------------------------------------------------------------
+            # Uncorrelated assemblies
+            #
+            # Form the Cartesian product between the configurations already
+            # generated and every configuration of this assembly.
+            # --------------------------------------------------------------
+            previous_configs = all_configs
+            previous_metadata = all_metadata
+
+            all_configs = []
+            all_metadata = []
+
+            for previous_config, previous_meta in zip(
+                previous_configs,
+                previous_metadata,
+            ):
+                for config, metadata in zip(
+                    assembly_configs,
+                    assembly_metadata,
+                ):
+                    combined = previous_config.copy()
+                    combined.extend(config)
+
+                    components = merge_component_counts(
+                        previous_meta["components"],
+                        metadata["components"],
+                    )
+
+                    all_configs.append(combined)
+
+                    all_metadata.append(
+                        {
+                            "components": components,
+                        }
+                    )
+
+        if not all_configs:
+            raise RuntimeError(
+                "Primitive-cell enumeration produced no configurations."
+            )
+
+        # ------------------------------------------------------------------
+        # Canonicalise and align molecular periodic images
+        #
+        # The first complete primitive configuration becomes the reference.
+        # Every other configuration is translated by whole lattice vectors so
+        # that equivalent Sxxx molecular sites occupy consistent periodic
+        # images before the configurations are assembled into supercells.
+        # ------------------------------------------------------------------
+        self.logger.debug(
+            "Canonicalising molecular images in reference configuration."
+        )
+
+        reference = canonicalise_reference_molecular_images(
+            all_configs[0],
+            cutoff_scale=1.5,
+        )
+
+        aligned_configs = [reference]
+
+        for config_index, config in enumerate(
+            all_configs[1:],
+            start=1,
+        ):
+            try:
+                aligned = align_molecular_images_to_reference(
+                    config,
+                    reference=reference,
+                    cutoff_scale=1.5,
+                )
+
+            except (ValueError, RuntimeError) as exc:
+                raise ValueError(
+                    "Failed to align molecular periodic images for "
+                    f"primitive configuration {config_index}."
+                ) from exc
+
+            aligned_configs.append(aligned)
+
+        # Metadata ordering remains identical to configuration ordering.
+        self.primitive_config_metadata = all_metadata
+
+        self.logger.debug(
+            "Generated and aligned %d primitive-cell configurations.",
+            len(aligned_configs),
+        )
+
+        return aligned_configs
 
     def get_supercell_configs(
         self,
@@ -706,8 +1045,6 @@ class OrderedfromDisordered:
         # Get all primitive configs
         self.images = self.get_all_configs(
             exclude_ordered=exclude_ordered,
-            keep_primitive=keep_primitive,
-            primitive_dir=primitive_dir,
         )
         
         self.component_labels = sorted(
